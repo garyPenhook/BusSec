@@ -1,0 +1,44 @@
+{
+    "version": "1.9",
+    "configurations": [
+        {
+            "name": "default",
+            "id": "conf1",
+            "device": "PIC32CM5164JH01048",
+            "imagePath": "./out/security_Reader/default.elf",
+            "packs": [
+                {
+                    "name": "PIC32CM-JH_DFP",
+                    "vendor": "Microchip",
+                    "version": "1.6.279"
+                },
+                {
+                    "name": "CMSIS",
+                    "vendor": "ARM",
+                    "version": "6.3.0"
+                }
+            ],
+            "fileSet": "default",
+            "toolchain": "default-ARM-GCC"
+        }
+    ],
+    "propertyGroups": [
+        {
+            "name": "default-ARM-GCC",
+            "type": "toolchain",
+            "provider": "microchip.toolchains:arm-gcc@14.3.1",
+            "properties": {}
+        }
+    ],
+    "fileSets": [
+        {
+            "name": "default",
+            "files": [
+                {
+                    "include": "**/*",
+                    "exclude": "**/(_build|out|cmake|.vscode)/**/*"
+                }
+            ]
+        }
+    ]
+}

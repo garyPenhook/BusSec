@@ -1,0 +1,166 @@
+#include "bussec_cli.h"
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "clock_config.h"
+#include "host_console.h"
+#include "pic32cm5164jh01048.h"
+
+/* Tiny bring-up CLI: no libc formatting, no heap, and predictable UART output. */
+#define BUSSEC_VERSION          "BusSec-PIC32CM v0.1-alpha"
+#define BUSSEC_CLI_LINE_LENGTH  (512u)
+#define BUSSEC_STATUS_TICK_HZ   (2u)
+
+static char cli_line[BUSSEC_CLI_LINE_LENGTH];
+static uint32_t cli_line_length;
+/* Updated by the TC0 ISR callback and consumed by the foreground CLI task. */
+static volatile uint32_t status_ticks;
+static uint32_t uptime_seconds;
+
+static void write_uint32(uint32_t value)
+{
+    /* Convert in reverse into a fixed stack buffer to avoid pulling in printf. */
+    char digits[10];
+    uint32_t count = 0u;
+
+    do {
+        digits[count] = (char)('0' + (value % 10u));
+        value /= 10u;
+        count++;
+    } while (value != 0u);
+
+    while (count != 0u) {
+        count--;
+        host_console_putc(digits[count]);
+    }
+}
+
+static bool text_equals(const char *left, const char *right)
+{
+    while ((*left != '\0') && (*right != '\0')) {
+        if (*left != *right) {
+            return false;
+        }
+        left++;
+        right++;
+    }
+
+    return (*left == '\0') && (*right == '\0');
+}
+
+static void write_status(void)
+{
+    host_console_write("STATUS uptime_s=");
+    write_uint32(uptime_seconds);
+    host_console_write(" cpu_hz=");
+    write_uint32(APP_CPU_CLOCK_HZ);
+    host_console_write(" host_baud=");
+    write_uint32(HOST_CONSOLE_BAUD);
+    host_console_write(" rx_overflows=");
+    write_uint32(host_console_rx_overflow_count());
+    host_console_write("\n");
+}
+
+static void write_help(void)
+{
+    host_console_write("Commands: version, help, status\n");
+}
+
+static void dispatch_command(void)
+{
+    /* Reserve one byte for the terminator by limiting input to LINE_LENGTH - 1. */
+    cli_line[cli_line_length] = '\0';
+
+    if (cli_line_length == 0u) {
+        return;
+    }
+
+    host_console_write("> ");
+    host_console_write(cli_line);
+    host_console_write("\n");
+
+    if (text_equals(cli_line, "version")) {
+        host_console_write(BUSSEC_VERSION "\nOK\n");
+    } else if (text_equals(cli_line, "help")) {
+        write_help();
+        host_console_write("OK\n");
+    } else if (text_equals(cli_line, "status")) {
+        write_status();
+        host_console_write("OK\n");
+    } else {
+        host_console_write("!ERR code=BAD_COMMAND\n");
+    }
+}
+
+static void handle_byte(uint8_t byte)
+{
+    if ((byte == '\r') || (byte == '\n')) {
+        /* Treat either newline convention as command submission. */
+        dispatch_command();
+        cli_line_length = 0u;
+        return;
+    }
+
+    if ((byte == '\b') || (byte == 0x7Fu)) {
+        /* Accept both ASCII backspace and DEL from common terminal emulators. */
+        if (cli_line_length != 0u) {
+            cli_line_length--;
+        }
+        return;
+    }
+
+    if ((byte < 0x20u) || (byte > 0x7Eu)) {
+        /* Ignore control and non-ASCII bytes until binary protocol support exists. */
+        return;
+    }
+
+    if (cli_line_length < (BUSSEC_CLI_LINE_LENGTH - 1u)) {
+        cli_line[cli_line_length] = (char)byte;
+        cli_line_length++;
+    } else {
+        /* Drop a partial overlong command instead of dispatching a truncated command. */
+        cli_line_length = 0u;
+        host_console_write("!ERR code=LINE_TOO_LONG\n");
+    }
+}
+
+void bussec_cli_init(void)
+{
+    cli_line_length = 0u;
+    status_ticks = 0u;
+    uptime_seconds = 0u;
+
+    host_console_write("# " BUSSEC_VERSION "\n");
+    host_console_write("# Type help\n");
+}
+
+void bussec_cli_status_tick(void)
+{
+    /* Called from the periodic timer path; keep this ISR-facing hook minimal. */
+    status_ticks++;
+}
+
+void bussec_cli_task(void)
+{
+    uint8_t byte;
+    uint32_t pending_status_ticks;
+
+    while (host_console_read_byte(&byte)) {
+        handle_byte(byte);
+    }
+
+    /* Snapshot and consume full seconds with interrupts masked around the shared counter. */
+    __disable_irq();
+    pending_status_ticks = status_ticks;
+    if (pending_status_ticks >= BUSSEC_STATUS_TICK_HZ) {
+        status_ticks = pending_status_ticks - BUSSEC_STATUS_TICK_HZ;
+    }
+    __enable_irq();
+
+    if (pending_status_ticks >= BUSSEC_STATUS_TICK_HZ) {
+        uptime_seconds++;
+        write_status();
+    }
+}
