@@ -15,7 +15,7 @@
 
 This design adds UPDI support to the existing BusSec UART/I²C/SPI toolkit.
 
-The word **hacking** in this document means practical lab work on owned or explicitly authorized hardware: discovery, programming, debug-interface interaction, protocol tracing, parser robustness testing, and recovery of self-owned devices. The design intentionally supports strong diagnostic capability. It does **not** include unauthorized bypass of access controls, third-party target workflows, stealthy extraction, malware behavior, or invasive/fault-injection bypass automation in the default firmware. It **does** include owner-authorized lock-validation testing: controlled attempts to read protected memory through documented programming/debug/bootloader interfaces on targets explicitly marked as owned test targets, with denial normally treated as the expected PASS result.
+The word **hacking** in this document means practical lab work on owned or explicitly authorized hardware: discovery, programming, debug-interface interaction, protocol tracing, parser robustness testing, and recovery of self-owned devices. The design intentionally supports strong diagnostic capability. It does **not** include unauthorized bypass of access controls, third-party target workflows, stealthy extraction, malware behavior, or invasive/fault-injection bypass automation in the default firmware. It **does** include owner-authorized lock-validation testing: controlled attempts to read protected memory through documented programming/debug/bootloader interfaces on targets explicitly marked as owned test targets, with denial normally treated as the expected PASS result. It also includes a separate RESEARCH_DEV path for non-destructive anomaly discovery on owned sacrificial targets; that path does not turn undocumented or protected readout into a default firmware feature.
 
 The tool should be capable enough to be useful on a real bench:
 
@@ -51,7 +51,7 @@ Design consequences:
 - Use `arm-none-eabi-gcc` with `-mcpu=cortex-m0plus -mthumb`.
 - Use CMSIS-Core and the Microchip PIC32CM-JH DFP device pack for headers/startup/linker material.
 - Treat Harmony/MCC output as reference material, not as mandatory architecture.
-- Keep critical data paths simple: ring buffers, DMA where useful, direct-register or thin-driver peripheral code.
+- Keep critical data paths simple: fixed ring buffers where producer and consumer timing can differ, DMA where useful, and direct-register or thin-driver peripheral code.
 
 ### 1.2 PIC32CM JH01 Curiosity Nano+ Touch bring-up board
 
@@ -63,7 +63,8 @@ Board-specific consequences:
 - The host console/log channel uses the debugger CDC UART connection.
 - On this board, debugger `CDC TX` connects to PIC32CM `PA00`, which is the target RX line.
 - On this board, debugger `CDC RX` connects to PIC32CM `PA01`, which is the target TX line.
-- Firmware maps the initial host console to `SERCOM1` on `PA00/PA01`.
+- The PIC32CM USART can receive on `SERCOM1 PAD0` at `PA00`, but it cannot transmit on `SERCOM1 PAD1` at `PA01`.
+- Firmware maps the bring-up host console to hardware SERCOM1 RX on `PA00` plus blocking GPIO software TX on `PA01`.
 - Treat these pins as board-bring-up assignments. A later custom BusSec board may move the host console to a different SERCOM/pin pair.
 - PA00 and PA01 are shared with the Curiosity Nano edge connector, so external hardware on those pins can interfere with the host console.
 
@@ -281,7 +282,7 @@ UPDI is included because it is closely related to UART-like microcontroller prog
 └────────────────────────────┬─────────────────────────────────┘
                              │
                              │ USB-UART / debugger VCP
-                             │ default 921600 8N1
+                             │ default 115200 8N1
                              │
 ┌────────────────────────────┴─────────────────────────────────┐
 │              PIC32CM5164JH01048 BusSec board                 │
@@ -615,7 +616,7 @@ Exact pin mux must be verified against the PIC32CM5164JH01048 package, the selec
 
 | Function | Peripheral class | Notes |
 |---|---|---|
-| Host console/log | SERCOM1 USART | Curiosity Nano nEDBG CDC VCP: PA00 target RX from debugger CDC TX, PA01 target TX to debugger CDC RX. |
+| Host console/log | SERCOM1 RX + GPIO TX for bring-up | Curiosity Nano nEDBG CDC VCP: PA00 target RX from debugger CDC TX, PA01 target TX to debugger CDC RX. PIC32CM USART TX cannot use SERCOM1 PAD1, so PA01 TX is software UART until custom hardware moves the console to a TX-capable SERCOM pad. |
 | UART A | SERCOM USART | Monitor/inject/bridge. |
 | UART B | SERCOM USART | Optional second monitor/bridge. |
 | UPDI | SERCOM USART | Half-duplex single-wire via external front-end. |
@@ -665,11 +666,13 @@ The PIC32CM5164JH01048 has 64 KB SRAM. Use the extra RAM, but do not become care
 
 ### 9.1 Default v1.x static buffer allocation
 
+Ring buffers are used only for asynchronous streams or event paths where the producer cannot wait for the consumer without risking data loss or timing violations. Simple bounded transactions use scratch buffers owned by the active command/state machine.
+
 | Buffer | Size |
 |---|---:|
 | Host RX command ring | 1024 bytes |
 | Host TX/log ring | 8192 bytes |
-| Event queue | 8192 bytes |
+| Compact event ring | 8192 bytes |
 | UART A RX ring | 8192 bytes |
 | UART B RX ring | 4096 bytes |
 | UART bridge ring A->B | 2048 bytes |
@@ -677,7 +680,9 @@ The PIC32CM5164JH01048 has 64 KB SRAM. Use the extra RAM, but do not become care
 | SPI TX scratch | 2048 bytes |
 | SPI RX scratch | 2048 bytes |
 | I²C scratch | 512 bytes |
-| UPDI RX/TX scratch | 1024 bytes |
+| UPDI bridge host->target ring | 512 bytes |
+| UPDI bridge target->host ring | 512 bytes |
+| Native UPDI RX/TX scratch | 1024 bytes |
 | UPDI program page buffer | 1024 bytes |
 | CLI input buffer | 512 bytes |
 | CLI output scratch | 1024 bytes |
@@ -834,6 +839,34 @@ Host dependencies:
 - optional: matplotlib for plots
 - optional: pyyaml for scripted profiles
 
+### 10.4 Ring buffer policy
+
+Use fixed-size, statically allocated ring buffers for:
+
+- ISR or DMA producer to foreground consumer handoff.
+- Foreground producer to interrupt/DMA TX handoff.
+- Host command RX before line parsing.
+- Host log TX when formatting can run ahead of the UART.
+- UART monitor RX and UART bridge forwarding.
+- Compact event records emitted by ISRs.
+- UPDI bridge byte forwarding, where host and UPDI timing are decoupled.
+
+Do not use rings for:
+
+- I²C scan/read/write transactions that complete under one command.
+- SPI transfers with known length and one owning command.
+- Native UPDI attach/read/write sequences, except for optional transcript/event logging.
+- CLI token parsing after a full command line has been collected.
+
+Ring implementation rules:
+
+- Sizes are powers of two so index wrap can use masks instead of division.
+- Head and tail indices are fixed-width unsigned types and are atomic-width for the producer/consumer context.
+- Single-producer/single-consumer rings need no lock if each side owns one index and memory ordering is preserved by normal interrupt boundaries.
+- Multi-producer paths must use a short critical section or be split into per-source rings.
+- Overflow never blocks an ISR. Drop according to the path policy, increment a counter, and emit an overflow event when possible.
+- DMA circular receive may use a hardware circular buffer as the producer-side ring; the firmware still accounts for consumed bytes, overruns, and timestamp boundaries.
+
 ---
 
 ## 11. Concurrency model
@@ -846,7 +879,7 @@ Priority model:
 |---:|---|---|
 | 0 | Hard fault / bus fault equivalent | Trap, log minimal state, halt or reset. |
 | 1 | SERCOM error IRQ | Capture overrun/framing/parity/collision status. |
-| 2 | DMA half/full IRQ | Move bulk data into rings. |
+| 2 | DMA half/full IRQ | Move streaming data into rings or update DMA ring consumption state. |
 | 3 | Timestamp overflow IRQ | Extend timestamp high word. |
 | 4 | Timer one-shot IRQ | Reset/power/UPDI timeout completion. |
 | 5 | SERCOM RX/TX IRQ | Low-volume UART/UPDI/I²C/SPI stepping. |
@@ -857,7 +890,7 @@ Rules:
 - ISRs do not allocate memory.
 - ISRs do not print text.
 - ISRs do not call the CLI parser.
-- ISRs push compact events into fixed rings.
+- ISRs push compact events into fixed rings when the event path is asynchronous.
 - Formatting happens in main loop.
 - Long captures stream to the host.
 - Any command that would block must become a state machine.
@@ -1009,6 +1042,8 @@ uart.monitor A mode=interrupt start
 uart.monitor A stop
 ```
 
+UART monitor uses an RX ring because incoming target bytes are asynchronous to host log formatting. DMA mode may use a circular DMA buffer plus software read indices instead of copying every byte into a separate software ring.
+
 ### 14.2 UART inject
 
 Transmit controlled bytes to the target.
@@ -1023,6 +1058,8 @@ uart.drive A disable
 
 Driving is explicit to avoid contention.
 
+UART injection uses direct transmit for short commands. A TX ring is optional only when queued injection must continue while the foreground command parser returns to other work.
+
 ### 14.3 UART bridge
 
 Raw pass-through first:
@@ -1032,7 +1069,7 @@ uart.bridge A B mode=passthru start
 uart.bridge A B stop
 ```
 
-Bridge logs both original and forwarded bytes. Under backpressure, forwarding has priority over byte-by-byte logging.
+Bridge uses directional rings because the two UART endpoints and the host logger can run at different rates. Under backpressure, forwarding has priority over byte-by-byte logging.
 
 ---
 
@@ -1063,6 +1100,8 @@ i2c.w  bus=1 addr=0x68 bytes=6b,00
 i2c.r  bus=1 addr=0x68 count=14
 i2c.wr bus=1 addr=0x68 w=75 r=1
 ```
+
+I²C transactions use bounded command-owned scratch buffers, not rings. The active I²C state machine owns the bus until the transaction completes, times out, or is aborted.
 
 ### 15.3 Bus recovery
 
@@ -1095,6 +1134,8 @@ Output:
 ```text
 1.300000000 SPI 1 XFER cs=CS0 mode=0 speed=1000000 tx=[9F FF FF FF] rx=[00 EF 40 16] ok
 ```
+
+SPI transfers use explicit TX/RX scratch buffers sized by the command limit. DMA may move those buffers, but generic SPI transactions do not need rings unless a later streaming flash-read mode is added.
 
 ### 16.2 v1.1 SPI flash helpers
 
@@ -1237,10 +1278,11 @@ Exit:
 Bridge requirements:
 
 - CLI parser is suspended during bridge mode.
-- Host bytes are forwarded to UPDI TX according to half-duplex rules.
+- Host bytes are accepted into a small bridge ring and forwarded to UPDI TX according to half-duplex rules.
 - Target bytes are forwarded back to host.
 - Optional transcript logging can be enabled, but raw bridge timing must take priority.
 - The bridge refuses to start if VTGT is missing or unsafe.
+- The UPDI line-state machine, not the ring itself, controls half-duplex direction and turnaround.
 
 Status output before entering bridge:
 
@@ -1437,6 +1479,8 @@ Output levels:
 
 The UPDI monitor should not claim nanosecond edge accuracy. It logs UART-level events, not analog signal-level details.
 
+UPDI monitor mode uses an RX/event ring because the observed byte stream is asynchronous to host formatting. Native UPDI command mode does not use a byte ring for command responses; each transaction owns its bounded response buffer and timeout state.
+
 ### 18.11 UPDI research mode
 
 Research mode exists for owned lab targets.
@@ -1447,9 +1491,11 @@ Allowed research actions:
 - Vary inter-byte delay.
 - Vary attach retry timing.
 - Log response timing.
+- Run safe anomaly scans that inspect timing, state transitions, and error classification.
 - Send malformed but non-destructive commands to a sacrificial target.
 - Replay a known programming session.
 - Compare behavior across AVR families.
+- Verify that the common policy gate rejects protected or undocumented readout requests.
 
 Disallowed in this firmware branch:
 
@@ -1457,10 +1503,15 @@ Disallowed in this firmware branch:
 - Fault injection to bypass lock/protection.
 - Glitch scheduling coupled to security-state transitions.
 - Hidden readout paths that ignore lock status.
+- Undocumented readout path searches that return protected firmware or data.
 
 Research command examples:
 
 ```text
+research begin confirm=SACRIFICIAL_TARGET
+research scan-safe
+policy selftest
+research end
 updi.research timing-sweep baud=115200..450000 target=ATmega4809 duration=10s
 updi.research attach-retry count=100 delay=1ms..20ms
 updi.research malformed-safe profile=sync-only seed=0x12345678 cases=1000
@@ -1692,9 +1743,9 @@ The firmware and host tools must distinguish four operating modes:
 | NORMAL | Bus monitoring, diagnostics, basic UPDI status work. | No | No |
 | PROGRAM | Programming owned targets. | No protected readout. | Confirmation required. |
 | LOCKTEST | Owner-authorized validation of target protection. | Yes, through documented interfaces only. | No by default. |
-| RESEARCH_DEV | Private developer/lab build. | Build-config dependent. | Build-config and confirmation required. |
+| RESEARCH_DEV | Lab anomaly discovery on owned sacrificial targets. | No protected or undocumented readout in this branch. | No by default. |
 
-All security-sensitive operations must pass through one policy gate. Confirmation tokens do not override protected readout rules in NORMAL or PROGRAM mode. LOCKTEST is the only normal build mode allowed to attempt protected-memory reads, and only for reporting whether protection holds.
+All security-sensitive operations must pass through one policy gate. Confirmation tokens do not override protected readout rules in NORMAL or PROGRAM mode. LOCKTEST is the only normal build mode allowed to attempt protected-memory reads, and only for reporting whether protection holds. RESEARCH_DEV may run non-destructive anomaly scans on owned sacrificial targets, but protected readout and undocumented readout probes are denied in this firmware branch.
 
 Suggested policy API:
 
@@ -1707,28 +1758,31 @@ typedef enum {
 } bussec_mode_t;
 
 typedef enum {
-    BUSSEC_OP_READ_SIG,
-    BUSSEC_OP_READ_STATUS,
-    BUSSEC_OP_READ_FUSES,
-    BUSSEC_OP_READ_FLASH,
-    BUSSEC_OP_READ_EEPROM,
-    BUSSEC_OP_READ_USERROW,
-    BUSSEC_OP_CHIP_ERASE,
-    BUSSEC_OP_FLASH_WRITE,
-    BUSSEC_OP_FUSE_WRITE,
-    BUSSEC_OP_HV_ACTIVATE,
-    BUSSEC_OP_FUZZ
-} bussec_op_t;
+    BUSSEC_POLICY_ACTION_READ_ID,
+    BUSSEC_POLICY_ACTION_READ_STATUS,
+    BUSSEC_POLICY_ACTION_DOCUMENTED_LOCKTEST_READ,
+    BUSSEC_POLICY_ACTION_RESEARCH_SAFE_ANOMALY_SCAN,
+    BUSSEC_POLICY_ACTION_RESEARCH_SACRIFICIAL_MALFORMED,
+    BUSSEC_POLICY_ACTION_PROTECTED_READOUT,
+    BUSSEC_POLICY_ACTION_UNDOCUMENTED_READOUT_PROBE,
+    BUSSEC_POLICY_ACTION_DESTRUCTIVE_WRITE
+} bussec_policy_action_t;
 
 typedef enum {
     BUSSEC_POLICY_ALLOW,
-    BUSSEC_POLICY_DENY_LOCKED_NORMAL_MODE,
     BUSSEC_POLICY_DENY_CONFIRM_REQUIRED,
-    BUSSEC_POLICY_DENY_VTGT,
-    BUSSEC_POLICY_DENY_PROFILE,
+    BUSSEC_POLICY_DENY_WRONG_MODE,
+    BUSSEC_POLICY_DENY_PROFILE_REQUIRED,
     BUSSEC_POLICY_DENY_BUILD_CONFIG,
-    BUSSEC_POLICY_DENY_HV_NOT_ARMED
+    BUSSEC_POLICY_DENY_PROTECTED_READOUT,
+    BUSSEC_POLICY_DENY_UNDOCUMENTED_READOUT
 } bussec_policy_result_t;
+
+typedef struct {
+    bool owned_target_confirmed;
+    bool sacrificial_target_confirmed;
+    bool target_profile_known;
+} bussec_policy_context_t;
 ```
 
 ### 20.6 LOCKTEST result classification
@@ -1833,6 +1887,11 @@ Host BusSec Python CLI handles device profiles and page streaming.
 Firmware handles low-level UPDI transactions.
 ```
 
+Host-side reference and reuse notes are tracked in
+`docs/host_reference_notes.md`. That file records which local and external
+projects are useful as patterns, and which parts should remain out of BusSec
+scope.
+
 ---
 
 ## 22. Fuzzing design
@@ -1907,10 +1966,16 @@ Strategies:
 
 UPDI fuzzing must be constrained because destructive commands exist.
 
+The current bring-up firmware starts this as a policy-gated CLI surface before
+the UPDI transaction layer exists. `research scan-safe` validates mode and
+sacrificial-target confirmation, then reports `updi_layer=missing`; later UPDI
+code must call the same policy gate before emitting any bus transaction.
+
 Profiles:
 
 | Profile | Allowed behavior |
 |---|---|
+| safe-anomaly | Timing/state/error-classification scan; no protected readout. |
 | sync-only | Break/sync/status timing only. |
 | attach-only | Attach/detach timing only. |
 | read-only | Signature/status/fuse reads only on unlocked owned target. |
@@ -1922,6 +1987,9 @@ Default profile is `sync-only`.
 Commands:
 
 ```text
+research begin confirm=SACRIFICIAL_TARGET
+research scan-safe
+research end
 updi.fuzz profile=sync-only seed=0x12345678 cases=1000 rate=10/s
 updi.fuzz profile=attach-only seed=0x12345678 cases=1000 rate=5/s
 updi.fuzz profile=sacrificial seed=0x12345678 cases=100 confirm=SACRIFICIAL_TARGET
@@ -1934,6 +2002,7 @@ UPDI fuzzing does not run if:
 - HV is armed.
 - A programming operation is active.
 - The user has not explicitly selected a profile.
+- The common policy gate denies the selected action.
 
 ---
 
@@ -1988,6 +2057,8 @@ This section verifies that BusSec can be used to test owner-controlled targets w
 | AR-010 | HV arm jumper absent | HV activate | Refused. |
 | AR-011 | Fuzz default profile | NVM command emission | Not possible. |
 | AR-012 | Destructive fuzz profile | No compile flag | Refused. |
+| AR-013 | RESEARCH_DEV mode | Undocumented readout probe | Refused by common policy gate. |
+| AR-014 | RESEARCH_DEV mode | Protected flash/data readout | Refused by common policy gate. |
 
 ### 23.4 Bridge-mode policy
 
@@ -2068,6 +2139,7 @@ SELF-005 Unsigned update image is denied if update support exists.
 [ ] Confirmation tokens cannot make NORMAL mode perform protected readout.
 [ ] All memory operations pass through a common policy gate.
 [ ] HV cannot fire without compile flag, board ID, arm jumper, VTGT, isolation, and token.
+[ ] RESEARCH_DEV safe anomaly scans do not emit protected or undocumented readout commands.
 [ ] Fuzzing cannot emit destructive or protected-memory commands by default.
 [ ] Raw bridge is unavailable in release builds.
 [ ] BusSec itself can be locked against casual firmware readout/replacement.

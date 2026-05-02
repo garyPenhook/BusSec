@@ -1,11 +1,13 @@
 #ifndef BUSSEC_CLI_H
 #define BUSSEC_CLI_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* Minimal UART command interface used during firmware bring-up. */
 void bussec_cli_init(void);
 void bussec_cli_task(void);
+bool bussec_cli_has_pending_work(void);
 /* Called by the periodic timer callback to advance CLI status timekeeping. */
 void bussec_cli_status_tick(void);
 

@@ -21,6 +21,7 @@ set(PIC32CM5164JH01048_APP_SOURCES
     "${PIC32CM5164JH01048_PROJECT_ROOT}/src/main.c"
     "${PIC32CM5164JH01048_PROJECT_ROOT}/src/board_led.c"
     "${PIC32CM5164JH01048_PROJECT_ROOT}/src/bussec_cli.c"
+    "${PIC32CM5164JH01048_PROJECT_ROOT}/src/bussec_policy.c"
     "${PIC32CM5164JH01048_PROJECT_ROOT}/src/clock_config.c"
     "${PIC32CM5164JH01048_PROJECT_ROOT}/src/host_console.c"
     "${PIC32CM5164JH01048_PROJECT_ROOT}/src/tc0_periodic.c")
@@ -55,8 +56,6 @@ endif()
 # Remove generated/local duplicate startup files from object libraries before adding our sources.
 set(PIC32CM5164JH01048_GENERATED_MAIN
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../main.c")
-set(PIC32CM5164JH01048_MAIN_SOURCE
-    "${PIC32CM5164JH01048_PROJECT_ROOT}/src/main.c")
 set(PIC32CM5164JH01048_LOCAL_STARTUP
     "${PIC32CM5164JH01048_PROJECT_ROOT}/startup_pic32cm5164jh01048.c")
 set(PIC32CM5164JH01048_LOCAL_SYSTEM
@@ -70,10 +69,12 @@ foreach(compile_target IN LISTS PIC32CM5164JH01048_COMPILE_TARGETS)
             "${PIC32CM5164JH01048_LOCAL_STARTUP}"
             "${PIC32CM5164JH01048_LOCAL_SYSTEM}")
 
-        list(FIND compile_target_sources "${PIC32CM5164JH01048_MAIN_SOURCE}" main_source_index)
-        if(main_source_index EQUAL -1)
-            list(APPEND compile_target_sources "${PIC32CM5164JH01048_MAIN_SOURCE}")
-        endif()
+        foreach(app_source IN LISTS PIC32CM5164JH01048_APP_SOURCES)
+            list(FIND compile_target_sources "${app_source}" app_source_index)
+            if(app_source_index EQUAL -1)
+                list(APPEND compile_target_sources "${app_source}")
+            endif()
+        endforeach()
 
         set_target_properties("${compile_target}" PROPERTIES
             SOURCES "${compile_target_sources}")

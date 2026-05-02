@@ -33,6 +33,11 @@ int main(void)
     for (;;) {
         /* Process all queued console input, then sleep until the next interrupt. */
         bussec_cli_task();
-        __WFI();
+        __disable_irq();
+        if (!bussec_cli_has_pending_work()) {
+            __DSB();
+            __WFI();
+        }
+        __enable_irq();
     }
 }

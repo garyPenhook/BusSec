@@ -9,6 +9,13 @@ The firmware runs on the PIC32CM board. A host-side tool will connect over the
 debugger CDC UART or a future dedicated serial link to configure buses, stream
 logs, run transactions, and generate reports.
 
+Current bring-up uses the PIC32CM JH01 Curiosity Nano+ Touch debugger CDC port
+at 115200 8N1. On that board PA00 is target RX from debugger CDC TX, and PA01 is
+target TX to debugger CDC RX. The PIC32CM USART cannot route hardware TX to
+SERCOM1 PAD1, so this firmware uses SERCOM1 RX on PA00 and a blocking GPIO
+software UART TX on PA01 until the host console can move to a TX-capable SERCOM
+pad on custom hardware.
+
 ## Finished Tool Goals
 
 The completed project will provide:
@@ -29,6 +36,8 @@ The completed project will provide:
 - Deterministic replay and fuzzing modes in later firmware versions.
 - LOCKTEST mode for owner-authorized validation that target lock or security
   settings block documented readout paths.
+- RESEARCH_DEV mode for non-destructive protocol anomaly discovery on owned
+  sacrificial targets.
 
 ## Intended Users
 
@@ -47,7 +56,12 @@ in the first major release. Its job is to keep timing-sensitive and
 hardware-facing work close to the MCU:
 
 - Configure and drive SERCOM peripherals for UART, I2C, SPI, and UPDI.
-- Use fixed ring buffers for bus traffic and host logs.
+- Use fixed ring buffers for asynchronous streams where producer and consumer
+  timing can differ: host RX, host log TX, UART monitor RX, bridge forwarding,
+  and compact event records.
+- Use bounded scratch buffers or direct state-machine transfers for simple
+  request/response work such as I2C transactions, SPI transfers, and native UPDI
+  commands.
 - Use interrupts and DMA where useful for high-volume RX/TX paths.
 - Maintain timestamp counters for event logging.
 - Enforce target-voltage checks before driving target-facing pins.
@@ -55,6 +69,8 @@ hardware-facing work close to the MCU:
   control.
 - Keep destructive or risky operations behind policy gates and explicit
   confirmation commands.
+- Route security-sensitive operations through one firmware policy gate so
+  normal, programming, LOCKTEST, and research behavior cannot drift apart.
 
 The firmware is not intended to be a high-speed logic analyzer or a storage
 device. Long captures will stream to the host.
@@ -70,6 +86,10 @@ The host side is expected to provide:
 - Device profiles for supported UPDI targets.
 - Replay tools and deterministic fuzz-case runners.
 - LOCKTEST text and JSON report generation.
+- RESEARCH_DEV anomaly-scan summaries for owned sacrificial targets.
+
+Reference notes for host-side patterns and outside repositories are in
+`docs/host_reference_notes.md`.
 
 ## UPDI Support
 
@@ -103,6 +123,27 @@ Expected PASS behavior for a protected target is:
 If a supposedly locked owned target allows protected readout, the tool should
 record that as a target security failure.
 
+## RESEARCH_DEV Mode
+
+RESEARCH_DEV is separate from LOCKTEST. It is for non-destructive protocol
+anomaly discovery on owned sacrificial targets: timing sweeps, attach retry
+variation, response logging, safe sync/status malformed-command profiles, and
+family-to-family behavior comparison.
+
+RESEARCH_DEV does not permit protected firmware/data readout, hidden readout
+path probing, fault-injection workflows, or destructive NVM operations in the
+default firmware branch. The current bring-up firmware exposes the policy
+surface through:
+
+- `research status`
+- `research begin confirm=SACRIFICIAL_TARGET`
+- `research scan-safe`
+- `research end`
+- `policy selftest`
+
+The UPDI transaction layer is not implemented yet, so `scan-safe` currently
+validates policy and reports that the UPDI layer is missing.
+
 ## Non-Goals
 
 The project will not try to become:
@@ -129,8 +170,9 @@ The planned feature path is:
 7. UPDI bridge mode.
 8. Native UPDI attach, read-signature, fuse/status read, and programming.
 9. LOCKTEST validation and report generation.
-10. Optional high-voltage UPDI add-on support.
-11. Deterministic fuzzing, replay, and later MITM/filter/scripted workflows.
+10. RESEARCH_DEV policy gates and non-destructive anomaly-scan support.
+11. Optional high-voltage UPDI add-on support.
+12. Deterministic fuzzing, replay, and later MITM/filter/scripted workflows.
 
 ## Current Repository Layout
 
@@ -144,3 +186,4 @@ out/        Build artifacts
 
 The detailed design plan is in
 `BusSec_Toolkit_PIC32CM_UPDI_Design_Plan_v0_4_LOCKTEST.md`.
+Host-side reuse/reference notes are in `docs/host_reference_notes.md`.
